@@ -1,10 +1,9 @@
 """
 match_works_v3.py
-══════════════════
 Links completed MPLADS works back to their recommended source, ranked
 across two confidence tiers.
 
-  TIER 1 · GOLD    all of:
+  TIER 1 · Definitive (strict)   all of:
     · same (MP, IDA) group, completion date ≥ recommendation date
     · embedding similarity ≥ 0.90
     · word-overlap (Jaccard) ≥ 0.95
@@ -12,11 +11,13 @@ across two confidence tiers.
     · no location conflict, no category conflict, no quantity conflict
     · duplicate-description tie-break (±10% amount)
 
-  TIER 2 · SILVER   relaxed fallback for Tier-1 misses:
+  TIER 2 · Provisional (not as strict as definitive):
     · similarity ≥ 0.80 · Jaccard ≥ 0.60 · amount delta ≤ 80%
     · location conflict still disqualifies
 
-  Everything else → unmatched_works.csv.
+  Everything else goes to → unmatched_works.csv. 
+  
+  (tuff?)
 """
 
 import os
@@ -39,13 +40,13 @@ UNMATCHED_OUT        = 'unmatched_works.csv'
 CACHE_FILE           = 'embeddings_cache.npz'
 MODEL_NAME           = 'all-MiniLM-L6-v2'
 
-# ── Tier 1 · Gold ────────────────────────────────────────────────────────────
+# ── Tier 1 · Definitive ────────────────────────────────────────────────────────────
 SIM_THRESHOLD        = 0.90
 JACCARD_THRESHOLD    = 0.95
 AMOUNT_MAX_DIFF_PCT  = 50.0
 DUP_AMOUNT_DIFF_PCT  = 10.0   # tie-break when two candidates share a description
 
-# ── Tier 2 · Silver (fallback only) ─────────────────────────────────────────
+# ── Tier 2 · Provisional (fallback only) ─────────────────────────────────────────
 TIER2_SIM_THRESHOLD       = 0.80
 TIER2_JACCARD_THRESHOLD   = 0.60
 TIER2_AMOUNT_MAX_DIFF_PCT = 80.0
