@@ -1,26 +1,22 @@
 """
-match_works_tiered.py — v3 + tiers
-====================================
-Reads the cleaned CSVs produced from dataset(1).zip, then matches completed MPLADS works to their recommended counterparts using a
-5-gate system, now split into TWO confidence tiers instead of one strict
-pass/fail:
+match_works_v3.py
+══════════════════
+Links completed MPLADS works back to their recommended source, ranked
+across two confidence tiers.
 
-  TIER 1 (Gold)   — the original, unchanged strict gates:
-    Gate 1: Same (MP Name, IDA) group + Recommendation Date <= Completed Date
-    Gate 2: Sentence-embedding cosine similarity >= 0.90
-    Gate 3: Word Jaccard overlap >= 0.95 on non-generic tokens
-    Gate 4: Amount difference <= 50%
-    Gate 5: Duplicate-description guard (10% amount tie-break)
+  TIER 1 · GOLD    all of:
+    · same (MP, IDA) group, completion date ≥ recommendation date
+    · embedding similarity ≥ 0.90
+    · word-overlap (Jaccard) ≥ 0.95
+    · amount delta ≤ 50%
+    · no location conflict, no category conflict, no quantity conflict
+    · duplicate-description tie-break (±10% amount)
 
-  TIER 2 (Silver) — relaxed thresholds, only applied to completed works
-    that FAILED Tier 1. These are "probable matches worth a human glance,"
-    not auto-trusted for fraud analysis:
-    - Sentence-embedding cosine similarity >= 0.80
-    - Word Jaccard overlap >= 0.60
-    - Amount difference <= 80%
-    - Same conflict-check as Tier 1 (still rejects clashing location names)
+  TIER 2 · SILVER   relaxed fallback for Tier-1 misses:
+    · similarity ≥ 0.80 · Jaccard ≥ 0.60 · amount delta ≤ 80%
+    · location conflict still disqualifies
 
-  Anything that fails BOTH tiers goes to unmatched_works.csv, same as before.
+  Everything else → unmatched_works.csv.
 """
 
 import os
@@ -34,7 +30,7 @@ import torch
 torch.set_num_threads(os.cpu_count() or 4)
 from sentence_transformers import SentenceTransformer, util
 
-# ── Files ──────────────────────────────────────────────────────────────────────
+# ── I/O ────────────────────────────────────────────────────────────────────
 REC_FILE             = 'cleaned_mplads_recommended_works.csv'
 COMP_FILE            = 'cleaned_mplads_completed_works.csv'
 MATCHED_OUT          = 'matched_works.csv'
@@ -43,18 +39,18 @@ UNMATCHED_OUT        = 'unmatched_works.csv'
 CACHE_FILE           = 'embeddings_cache.npz'
 MODEL_NAME           = 'all-MiniLM-L6-v2'
 
-# ── Tier 1 thresholds (Gold — unchanged from original) ──────────────────────────
-SIM_THRESHOLD        = 0.90   # Gate 2: embedding cosine similarity
-JACCARD_THRESHOLD    = 0.95   # Gate 3: word-level Jaccard overlap
-AMOUNT_MAX_DIFF_PCT  = 50.0   # Gate 4: amount difference %
-DUP_AMOUNT_DIFF_PCT  = 10.0   # Gate 5: tighter amount check for duplicate descriptions
+# ── Tier 1 · Gold ────────────────────────────────────────────────────────────
+SIM_THRESHOLD        = 0.90
+JACCARD_THRESHOLD    = 0.95
+AMOUNT_MAX_DIFF_PCT  = 50.0
+DUP_AMOUNT_DIFF_PCT  = 10.0   # tie-break when two candidates share a description
 
-# ── Tier 2 thresholds (Silver — relaxed, only tried on Tier-1 failures) ─────────
+# ── Tier 2 · Silver (fallback only) ─────────────────────────────────────────
 TIER2_SIM_THRESHOLD       = 0.80
 TIER2_JACCARD_THRESHOLD   = 0.60
 TIER2_AMOUNT_MAX_DIFF_PCT = 80.0
 
-# ── Stop words (generic terms that must NOT count as "meaningful" tokens) ──────
+# ── Stop words — generic terms stripped before token comparison ─────────────
 _STOP = {
     # Construction/infra verbs and nouns
     'CONSTRUCTION','CONSTR','REPAIR','RENOVATION','PROVIDING','DEVELOPMENT',
@@ -172,7 +168,44 @@ def has_conflict(desc_a: str, desc_b: str) -> bool:
     return not a_found_in_b and not b_found_in_a
 
 
-# ── Data loading ───────────────────────────────────────────────────────────────
+def category_conflict(cat_a, cat_b) -> bool:
+    """True if both categories are known but genuinely don't align."""
+    a = str(cat_a).strip().upper() if pd.notna(cat_a) else ''
+    b = str(cat_b).strip().upper() if pd.notna(cat_b) else ''
+    if not a or not b:
+        return False               # missing data → can't judge, don't punish
+    return a != b and a not in b and b not in a
+
+
+_QTY_RE = re.compile(
+    r'(\d+(?:\.\d+)?)\s*(MTR|METER|METRE|KM|FT|FEET|NOS|NO|SQM|SQFT|LTR|LITRE|KVA|KW|HP)\b'
+)
+
+def _quantities(text: str) -> set:
+    """Pull out measured quantities like '500MTR' or '10NOS' from text."""
+    if not isinstance(text, str):
+        return set()
+    return {f"{m.group(1)}{m.group(2)}" for m in _QTY_RE.finditer(text.upper())}
+
+
+def quantity_conflict(desc_a: str, desc_b: str) -> bool:
+    """True if both sides quote measurements, but none of them agree."""
+    qa, qb = _quantities(desc_a), _quantities(desc_b)
+    if not qa or not qb:
+        return False
+    return qa.isdisjoint(qb)
+
+
+# ── Data loading ─────────────────────────────────────────────────────────────
+
+def embed_text(row) -> str:
+    """Text actually handed to the AI model — description alone is thin;
+    prefixing the category grounds the embedding in *what kind* of work
+    this is, not just how it's worded."""
+    cat  = str(row['Category']).strip() if pd.notna(row['Category']) else ''
+    desc = str(row['Work Description']).strip()
+    return f"{cat}: {desc}" if cat else desc
+
 
 def load_data():
     print("-> Loading datasets...")
@@ -191,10 +224,10 @@ def load_data():
     return df_rec, df_comp
 
 
-# ── Embedding cache ────────────────────────────────────────────────────────────
+# ── Embedding cache ──────────────────────────────────────────────────────────
 
-def get_embeddings(unique_descs: list) -> dict:
-    """Load from .npz cache or encode with sentence-transformer on CPU."""
+def get_embeddings(unique_texts: list) -> dict:
+    """Pull vectors from disk cache; encode only what's missing."""
     cache = {}
     if os.path.exists(CACHE_FILE):
         print(f"-> Loading embedding cache '{CACHE_FILE}'...")
@@ -207,7 +240,7 @@ def get_embeddings(unique_descs: list) -> dict:
             print(f"   Cache load failed: {e} — recomputing.")
             cache = {}
 
-    missing = [d for d in unique_descs if d not in cache]
+    missing = [d for d in unique_texts if d not in cache]
     if missing:
         print(f"-> Encoding {len(missing):,} new descriptions on CPU (this takes time once)...")
         model = SentenceTransformer(MODEL_NAME, device='cpu')
@@ -238,19 +271,30 @@ def run_matching(df_rec, df_comp):
     for _, c in df_comp.iterrows():
         comp_idx.setdefault((c['mp_key'], c['ida_key']), []).append(c)
 
-    # Collect descriptions that matter
+# ── Matching ─────────────────────────────────────────────────────────────────
+
+def run_matching(df_rec, df_comp):
+    print("\n-> Grouping by (MP Name, IDA)...")
+    rec_idx = {}
+    for _, r in df_rec.iterrows():
+        rec_idx.setdefault((r['mp_key'], r['ida_key']), []).append(r)
+
+    comp_idx = {}
+    for _, c in df_comp.iterrows():
+        comp_idx.setdefault((c['mp_key'], c['ida_key']), []).append(c)
+
+    # Only embed text for groups that actually have candidates on both sides
     relevant = set()
     for key, rows in comp_idx.items():
         if key in rec_idx:
             for r in rows + rec_idx[key]:
-                if pd.notna(r['Work Description']):
-                    relevant.add(str(r['Work Description']).strip())
-    print(f"   Unique descriptions to embed: {len(relevant):,}")
+                relevant.add(embed_text(r))
+    print(f"   Unique texts to embed: {len(relevant):,}")
 
     emb_map = get_embeddings(list(relevant))
     ZERO    = torch.zeros(384)
 
-    print("\n-> Matching with tiered gate filter (Tier 1 strict, Tier 2 relaxed)...")
+    print("\n-> Matching — Tier 1 strict, Tier 2 relaxed fallback...")
     matched, tier2, unmatched = [], [], []
     total    = len(df_comp)
     done     = 0
@@ -267,14 +311,11 @@ def run_matching(df_rec, df_comp):
                 done, last_rep = _maybe_print(done, total, t0, last_rep, matched, unmatched)
             continue
 
-        # Embeddings for this group
-        c_embs = torch.stack([emb_map.get(str(r['Work Description']).strip(), ZERO) for r in comp_rows])
-        r_embs = torch.stack([emb_map.get(str(r['Work Description']).strip(), ZERO) for r in cand_rows])
-
-        # Gate 2: cosine similarity matrix (N_comp × N_cand)
+        c_embs = torch.stack([emb_map.get(embed_text(r), ZERO) for r in comp_rows])
+        r_embs = torch.stack([emb_map.get(embed_text(r), ZERO) for r in cand_rows])
         sim_mat = util.cos_sim(c_embs, r_embs)
 
-        # Gate 1b: date mask  (rec_date <= comp_date)
+        # completion can't predate its own recommendation
         r_dates = np.array([r['Recommendation Date'] for r in cand_rows])
         c_dates = np.array([c['Completed Date']       for c in comp_rows])
         date_ok = torch.tensor(
@@ -283,10 +324,9 @@ def run_matching(df_rec, df_comp):
         )
         sim_mat[~date_ok] = -1.0
 
-        # Collect valid edges for this group, split into Tier 1 (strict) and
-        # Tier 2 (relaxed) buckets. A pair only needs to pass the LOWER
-        # Tier 2 bar to be recorded at all; whether it lands in Tier 1 or
-        # Tier 2 depends on which bar it actually clears.
+        # Every pair clearing the Tier 2 floor lands in edges_t2; those that
+        # ALSO clear the Tier 1 bar (plus the three conflict checks) get
+        # promoted into edges_t1 below.
         edges_t1 = []
         edges_t2 = []
         for i, c_row in enumerate(comp_rows):
@@ -321,7 +361,9 @@ def run_matching(df_rec, df_comp):
                 passes_tier1 = (
                     sim_val >= SIM_THRESHOLD and
                     jac >= JACCARD_THRESHOLD and
-                    (pd.isna(amt_diff) or amt_diff <= AMOUNT_MAX_DIFF_PCT)
+                    (pd.isna(amt_diff) or amt_diff <= AMOUNT_MAX_DIFF_PCT) and
+                    not category_conflict(c_row['Category'], r_row['Category']) and
+                    not quantity_conflict(c_desc, r_desc)
                 )
                 if passes_tier1:
                     same_desc_cands = [r for r in cand_rows if str(r['Work Description']).strip() == r_desc]
@@ -329,14 +371,14 @@ def run_matching(df_rec, df_comp):
                         if pd.notna(r_amt) and r_amt > 0 and pd.notna(c_amt):
                             tight_diff = abs(c_amt - r_amt) / r_amt * 100.0
                             if tight_diff > DUP_AMOUNT_DIFF_PCT:
-                                passes_tier1 = False  # fails the duplicate tie-break, demote to Tier 2
+                                passes_tier1 = False  # loses the duplicate tie-break — Tier 2 instead
 
                 if passes_tier1:
                     edges_t1.append(edge)
                 else:
                     edges_t2.append(edge)
 
-        # Greedily match Tier 1 first (best score wins, same logic as original)
+        # Tier 1 claims first, best score wins
         edges_t1.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
         matched_c = set()
         matched_r = set()
@@ -352,16 +394,15 @@ def run_matching(df_rec, df_comp):
             c_to_edge[i] = edge
             tier_of_c[i] = 1
 
-        # Then try Tier 2 for completed works that Tier 1 didn't claim.
-        # Tier 2 can reuse recommended rows already used by Tier 1 (a
-        # relaxed match is still worth surfacing for manual review), but
-        # not rows another Tier 2 match already grabbed.
+        # Tier 2 mops up whatever Tier 1 left unclaimed. It may reuse a
+        # recommended row Tier 1 already took (one proposal, several real
+        # phases isn't unusual) but not one another Tier 2 match already has.
         edges_t2.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
         matched_r_t2 = set()
         for edge in edges_t2:
             sim_val, jac, neg_amt_diff, i, j = edge
             if i in matched_c:
-                continue   # already has a Tier 1 match
+                continue
             if j in matched_r_t2:
                 continue
             matched_c.add(i)
@@ -369,7 +410,7 @@ def run_matching(df_rec, df_comp):
             c_to_edge[i] = edge
             tier_of_c[i] = 2
 
-        # Now output matches (tier 1 or tier 2) and unmatches for completed works
+        # Write out this group's verdicts
         for i, c_row in enumerate(comp_rows):
             done += 1
             if i in c_to_edge:
@@ -455,23 +496,24 @@ def _maybe_print(done, total, t0, last_rep, matched, unmatched):
 
 
 def print_summary(df_m, df_t2, df_u, total):
+    """Console verdict — headline numbers, then a fresh random peek at Tier 1."""
     n, n2, u = len(df_m), len(df_t2), len(df_u)
     avg  = df_m['Similarity Score'].mean() if n else 0.0
     avg2 = df_t2['Similarity Score'].mean() if n2 else 0.0
     print("\n" + "="*85)
-    print("  MATCHING SUMMARY  (tiered: Tier1 sim>=0.90/Jac>=0.95/amt<=50% | Tier2 sim>=0.80/Jac>=0.60/amt<=80%)")
+    print("  MATCH SUMMARY  ·  Tier1: sim≥0.90 Jac≥0.95 amt≤50%  |  Tier2: sim≥0.80 Jac≥0.60 amt≤80%")
     print("="*85)
-    print(f"  Total completed works       : {total:,}")
-    print(f"  Tier 1 (gold) matches       : {n:,}   ({n/total*100:.2f}%)   avg similarity {avg:.4f}")
-    print(f"  Tier 2 (silver) matches     : {n2:,}   ({n2/total*100:.2f}%)   avg similarity {avg2:.4f}")
-    print(f"  Still unmatched             : {u:,}   ({u/total*100:.2f}%)")
-    print(f"  Combined (Tier1+Tier2)      : {n+n2:,}   ({(n+n2)/total*100:.2f}%)")
+    print(f"  Total completed works   : {total:,}")
+    print(f"  Tier 1 · Gold           : {n:,}   ({n/total*100:.2f}%)   avg sim {avg:.4f}")
+    print(f"  Tier 2 · Silver         : {n2:,}   ({n2/total*100:.2f}%)   avg sim {avg2:.4f}")
+    print(f"  Unmatched               : {u:,}   ({u/total*100:.2f}%)")
+    print(f"  Combined                : {n+n2:,}   ({(n+n2)/total*100:.2f}%)")
     print("="*85)
 
     if n > 0:
-        print("\n  10 RANDOM MATCHED EXAMPLES")
+        print("\n  10 RANDOM TIER-1 MATCHES  (a fresh draw every run)")
         print("="*85)
-        for idx, (_, row) in enumerate(df_m.sample(min(10, n), random_state=77).iterrows(), 1):
+        for idx, (_, row) in enumerate(df_m.sample(min(10, n)).iterrows(), 1):
             print(f"\n#{idx}  Score:{row['Similarity Score']:.4f}  "
                   f"Jaccard:{row['Jaccard Score']:.3f}  "
                   f"Delay:{row['Delay (Days)']} days  "
@@ -481,19 +523,19 @@ def print_summary(df_m, df_t2, df_u, total):
             print("-"*85)
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     df_rec, df_comp = load_data()
     df_m, df_t2, df_u = run_matching(df_rec, df_comp)
 
-    print(f"\n-> Saving {len(df_m):,} Tier 1 (gold) matched rows → '{MATCHED_OUT}'")
+    print(f"\n-> {len(df_m):,} Tier 1 rows → '{MATCHED_OUT}'")
     df_m.to_csv(MATCHED_OUT, index=False)
 
-    print(f"-> Saving {len(df_t2):,} Tier 2 (silver) possible matches → '{TIER2_OUT}'")
+    print(f"-> {len(df_t2):,} Tier 2 rows → '{TIER2_OUT}'")
     df_t2.to_csv(TIER2_OUT, index=False)
 
-    print(f"-> Saving {len(df_u):,} unmatched rows → '{UNMATCHED_OUT}'")
+    print(f"-> {len(df_u):,} unmatched rows → '{UNMATCHED_OUT}'")
     df_u.to_csv(UNMATCHED_OUT, index=False)
 
     print_summary(df_m, df_t2, df_u, len(df_comp))
