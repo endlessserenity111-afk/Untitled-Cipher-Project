@@ -1,21 +1,11 @@
 """
-clean_and_explore.py
-=====================
+clean_and_explore.py :
+
 Cleans raw MPLADS 'recommended works' and 'completed works' exports into the
 two CSVs that match_works_tiered.py (and match_works.py) expect:
 
     cleaned_mplads_recommended_works.csv
     cleaned_mplads_completed_works.csv
-
-ASSUMPTIONS (adjust RAW_REC_FILE / RAW_COMP_FILE and the column-rename maps
-below to match whatever your actual raw source files look like — I don't
-have the original raw export format, so this is a reasonable starting
-skeleton, not a guaranteed drop-in):
-
-  - Raw files are CSV or can be unzipped from dataset(1).zip into CSV.
-  - Recommended-works raw file has columns for MP name, IDA, work
-    description, recommended amount, recommendation date, category, etc.
-  - Completed-works raw file has the equivalent fields for completed works.
 
 Run this BEFORE match_works_tiered.py — it's step 1 of the pipeline.
 """
@@ -24,17 +14,15 @@ import os
 import zipfile
 import pandas as pd
 
-# ── Raw input files (adjust to your actual filenames) ───────────────────────
+#  Raw input files
 RAW_REC_FILE   = 'mplads_recommended_works_raw.csv'
 RAW_COMP_FILE  = 'mplads_completed_works_raw.csv'
 DATASET_ZIP    = 'dataset(1).zip'   # raw CSVs are inside this zip
 
-# ── Cleaned output files (must match REC_FILE / COMP_FILE in match_works*.py)
+#  Cleaned output files 
 CLEAN_REC_OUT  = 'cleaned_mplads_recommended_works.csv'
 CLEAN_COMP_OUT = 'cleaned_mplads_completed_works.csv'
 
-# Columns match_works_tiered.py actually reads — every one of these must
-# exist (with these exact names) in the cleaned output.
 REQUIRED_REC_COLS = [
     'Work ID', 'Work Description', 'Category', 'MP Name', 'IDA',
     'Recommended Amount (₹)', 'Recommendation Date', 'Has Images',
